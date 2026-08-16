@@ -30,8 +30,9 @@ That's the whole tech stack in one sentence:
 2. ✅ **docker-compose** — TaskVault + Postgres together, local dev loop.
 3. ✅ **Instrument** — `/metrics` endpoint, first Prometheus concepts, standalone Prometheus container scraping it.
 4. ✅ **Kubernetes** — kind cluster, Deployment + Service, self-healing, PersistentVolumeClaim, Secrets.
-5. ⬜ **Prometheus + Grafana in-cluster** — Helm, scraping, first dashboard.
-6. ⬜ **PromQL + real dashboard** — latency, error rate, request volume panels.
+5. ✅ **Prometheus + Grafana in-cluster** — Helm, `ServiceMonitor`, first Grafana dashboard.
+6. ✅ **PromQL + real dashboard** — request rate, p95 latency, error rate panels (RED method). Folded
+   into Chapter 5 in practice — building the dashboard *was* the PromQL depth.
 7. ⬜ *(advanced)* Chaos — kill pods, watch self-heal, build alerts (Alertmanager).
 8. ⬜ *(advanced)* Autoscaling (HPA), Ingress, Loki logs.
 
@@ -53,7 +54,9 @@ That's the whole tech stack in one sentence:
 - `prometheus-fastapi-instrumentator` for `/metrics`
 - Docker, Docker Compose
 - Kubernetes via `kind` (Kubernetes-in-Docker), `kubectl`
-- Prometheus (standalone in Compose for Ch.3; will move in-cluster in Ch.5)
+- Prometheus (standalone in Compose for Ch.3; in-cluster via Helm from Ch.5 on)
+- Helm — `kube-prometheus-stack` chart (Prometheus + Grafana + Alertmanager + node-exporter +
+  kube-state-metrics + Prometheus Operator/CRDs)
 
 ## Run it — Docker Compose (Chapters 1-3)
 
@@ -86,6 +89,26 @@ Then `curl http://localhost:8000/items` in another terminal.
 If you rebuild the app image (`docker compose build api` or `docker build .`), you must
 re-`kind load docker-image` and `kubectl rollout restart deployment/api` — kind's node doesn't
 see new local images automatically.
+
+## Run it — Prometheus + Grafana in-cluster (Chapter 5)
+
+```
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+kubectl create namespace monitoring
+helm install monitoring prometheus-community/kube-prometheus-stack --namespace monitoring
+
+kubectl apply -f k8s/api-service.yaml
+kubectl apply -f k8s/api-servicemonitor.yaml
+
+kubectl --namespace monitoring port-forward svc/monitoring-grafana 3000:80
+```
+
+- Grafana: http://localhost:3000, user `admin`, password:
+  `kubectl --namespace monitoring get secrets monitoring-grafana -o jsonpath="{.data.admin-password}" | base64 -d; echo`
+- Prometheus UI (optional, for raw PromQL): `kubectl --namespace monitoring port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090`
+- Dashboard saved in Grafana as **TaskVault** — Request Rate, p95 Latency, Error Rate panels.
 
 ---
 
@@ -250,6 +273,79 @@ that annotation regardless of resource type. Real production gotcha, not specifi
 mitigated by using `kubectl create`/`kubectl replace` for Secrets instead of `apply`, or by never
 hand-authoring Secret YAML with real credentials in the first place (see below).
 
+### Chapter 5 — Prometheus + Grafana in-cluster (Helm) + real dashboard
+
+Replaced the Chapter 3 standalone Compose Prometheus with the real, production-shaped pattern:
+monitoring installed *inside* the cluster it's watching, via Helm.
+
+**Helm** — package manager for Kubernetes. Installs a whole bundle of related resources
+(Deployments, Services, Secrets, CRDs...) as one versioned "release" instead of hand-writing YAML
+for each piece — the thing Chapters 1-4 did manually for two services would be dozens of files at
+real scale. `helm repo add`/`helm repo update` register and refresh a chart source (global config,
+not tied to the project directory — unlike `git`). `helm install monitoring
+prometheus-community/kube-prometheus-stack --namespace monitoring` pulled down Prometheus,
+Grafana, Alertmanager, node-exporter, kube-state-metrics, and the Prometheus Operator — all
+pre-wired together — in one command.
+
+**Namespaces vs labels, reinforced:** put the whole monitoring stack in its own `monitoring`
+namespace (partition of the cluster, own default scope for `kubectl get`) to keep it separate from
+`api`/`postgres` in `default`. Filtering `kubectl get pods -l "release=monitoring"` initially
+*missed* the Grafana pod — turned out Grafana's subchart tags its pod with a slightly different
+label set than the top-level release label, not a real problem, just a reminder that label
+filters are exact-match and chart-dependent.
+
+**Wiring TaskVault in — `ServiceMonitor`:** a CRD (Custom Resource Definition) added by the
+Prometheus Operator, not built into core Kubernetes. It tells the Operator "watch this Service,
+scrape it," replacing Chapter 3's hand-edited `prometheus.yml`/`scrape_configs` entirely — add a
+label, apply a small YAML file, Prometheus finds it automatically from then on. Two things had to
+line up for it to work:
+- `k8s/api-service.yaml` needed `metadata.labels: app: api` (the *Service object's own* labels —
+  separate from `spec.selector`, which picks pods, not the Service itself) and a **named** port
+  (`name: web`) — `ServiceMonitor` references ports by name, not number.
+- `k8s/api-servicemonitor.yaml` needed `metadata.labels: release: monitoring` — kube-prometheus-stack's
+  Prometheus, by default, only picks up `ServiceMonitor`s carrying that exact label (matching the
+  Helm release name). Miss it, Prometheus silently ignores the file — no error, just never shows
+  up as a scrape target.
+
+**Bug hit typing `api-servicemonitor.yaml`:** `spec:` kept landing indented under `metadata:`
+instead of flush-left as its own top-level key — three passes to get it out. A `kind:` block whose
+`spec` accidentally nests under `metadata` doesn't error at the YAML level, it just silently drops
+the real `spec` and the resource does nothing useful. Caught each time by reading the file back.
+
+Confirmed the wiring end-to-end at `/targets` in the Prometheus UI — `default/api-servicemonitor`
+showed `1/1 up`. (Also saw several *other* targets down — `kube-controller-manager`, `kube-etcd`,
+`kube-proxy`, `kube-scheduler` — a known `kind`-specific gotcha: the chart's default ServiceMonitors
+expect control-plane components exposed the way real clusters expose them, which `kind`'s
+control-plane pods don't match. Unrelated to TaskVault, safe to ignore for this project.)
+
+**Grafana + first real dashboard:** port-forwarded `svc/monitoring-grafana` (a *Service*, same
+pattern as `api` in Chapter 4), logged in with the admin password pulled from Grafana's own
+auto-generated Secret (same base64-decode pattern as Chapter 4's Postgres Secret). Built a
+dashboard named **TaskVault** with three panels — the classic **RED method** (Rate, Errors,
+Duration):
+- **Request Rate** — `rate(http_requests_total{handler="/items"}[1m])`. `rate()` turns a
+  monotonically-climbing counter into a per-second velocity over a trailing window — the raw
+  counter alone is only useful summed/diffed, not eyeballed directly.
+- **p95 Latency** — `histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, handler))`.
+  Reconstructs the 95th-percentile latency from the histogram's `le` (less-than-or-equal) buckets
+  that the instrumentator already tracks. Came out as a flat, blocky line — expected with low
+  request volume, since `histogram_quantile` interpolates within whichever bucket the 95th-percentile
+  count falls into, and sparse traffic tends to land squarely on one bucket edge. Not a bug, just
+  what the math looks like without sustained load.
+- **Error Rate** — `(sum(rate(http_requests_total{status=~"5.."}[5m])) or vector(0)) / sum(rate(http_requests_total[5m]))`.
+
+**Bug/gotcha hit on the error-rate query:** with zero 5xx responses ever recorded, the numerator
+matched *no time series at all* — and in PromQL, "no series" is not the same thing as "series with
+value 0." Dividing empty-by-anything produces another empty result, so the panel rendered nothing,
+not even a flat zero line. Fixed with `or vector(0)` — substitutes a literal zero series whenever
+the left side is empty, giving the division something to actually operate on. Resulting flat 0
+line is the *correct*, good-news result — proof the panel logic works, not evidence of missing data.
+
+Generated real traffic to see it live: `curl -X POST /items` × 10 to seed test data, then repeated
+`GET /items` — watched Request Rate spike and decay in real time on the Request Rate panel.
+
+![TaskVault Grafana dashboard — Request Rate, p95 Latency, Error Rate](screenshots/grafana_dashboards.png)
+
 ---
 
 ## What to learn next
@@ -264,10 +360,7 @@ hand-authoring Secret YAML with real credentials in the first place (see below).
     part is HCP Vault, their managed cloud offering — not needed). Bigger investment: init/unseal,
     auth methods, policies. Most transferable resume skill, but a proper dedicated detour rather
     than a quick add-on — good candidate for one of the advanced chapters later.
-- **Chapter 5** — Prometheus + Grafana installed *in-cluster* via Helm (replacing the standalone
-  Compose Prometheus from Chapter 3), first real Grafana dashboard.
-- **Chapter 6** — PromQL depth: latency (p50/p95/p99 from the histogram buckets), error rate,
-  request volume panels.
 - **Chapter 7 (advanced)** — chaos: kill pods under load, watch self-heal in real time, build
-  actual alerts via Alertmanager.
+  actual alerts via Alertmanager (already installed as part of the Chapter 5 Helm chart, unused
+  so far).
 - **Chapter 8 (advanced)** — Horizontal Pod Autoscaler, Ingress, centralized logs via Loki.
