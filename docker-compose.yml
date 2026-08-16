@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://sentinel:sentinel@db:5432/sentinel
+    depends_on:
+      db:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+volumes:
+  pgdata:
